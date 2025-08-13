@@ -168,7 +168,17 @@ and gen_simple_binary_op env op e1 e2 =
     else if List.length e2_code = 1 then
       let modified_code = List.map (fun inst ->
         if String.contains inst 't' && String.contains inst '0' then
-          Str.global_replace (Str.regexp "t0") "t1" inst
+          (* 简单的字符串替换，不使用Str模块 *)
+          let len = String.length inst in
+          let buffer = Buffer.create len in
+          let i = ref 0 in
+          while !i < len do
+            if !i < len - 1 && inst.[!i] = 't' && inst.[!i + 1] = '0' then
+              (Buffer.add_string buffer "t1"; i := !i + 2)
+            else
+              (Buffer.add_char buffer inst.[!i]; incr i)
+          done;
+          Buffer.contents buffer
         else inst
       ) e2_code in
       modified_code
@@ -520,20 +530,25 @@ let peephole_optimize (code: string list) : string list =
     
     (* 优化跳转到下一条指令 *)
     | ins1 :: ins2 :: rest when (
-        match (Scanf.sscanf_opt ins1 "  j %s@" (fun label -> label),
-               String.sub ins2 0 (min (String.length ins2) (String.length ins2 - 1))) with
-        | (Some label, label2) when label = label2 -> true
-        | _ -> false
+        match Scanf.sscanf_opt ins1 "  j %s@" (fun label -> label) with
+        | Some label -> 
+            let label_with_colon = label ^ ":" in
+            String.equal ins2 label_with_colon
+        | None -> false
       ) -> ins2 :: (optimize_pass rest)
     
     (* 移除跳转后的死代码 *)
-    | ins1 :: rest when (String.starts_with ~prefix:"  j " ins1 || 
-                         String.starts_with ~prefix:"  ret" ins1) ->
+    | ins1 :: rest when (
+        let starts_with_j = String.length ins1 >= 4 && String.sub ins1 0 4 = "  j " in
+        let starts_with_ret = String.length ins1 >= 5 && String.sub ins1 0 5 = "  ret" in
+        starts_with_j || starts_with_ret
+      ) ->
         let rec drop_unreachable remaining =
           match remaining with
           | [] -> []
-          | l :: ls when String.ends_with ~suffix:":" l -> l :: ls
-          | _ :: ls -> drop_unreachable ls
+          | l :: ls -> 
+              let ends_with_colon = String.length l > 0 && l.[String.length l - 1] = ':' in
+              if ends_with_colon then l :: ls else drop_unreachable ls
         in
         ins1 :: (optimize_pass (drop_unreachable rest))
     
