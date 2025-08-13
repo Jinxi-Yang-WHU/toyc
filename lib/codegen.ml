@@ -98,11 +98,11 @@ let rec count_local_vars_stmt stmt =
 
 (* --- 优化 3: 智能寄存器使用 --- *)
 let select_work_reg complexity in_loop =
-  match complexity with
-  | Simple when not in_loop -> t0
-  | Simple when in_loop -> t0  (* 循环中保持简单 *)
-  | Medium -> t0
-  | Complex -> t0
+  match (complexity, in_loop) with
+  | (Simple, false) -> t0
+  | (Simple, true) -> t0  (* 循环中保持简单 *)
+  | (Medium, _) -> t0
+  | (Complex, _) -> t0
 
 (* --- 优化 4: 改进的表达式生成 --- *)
 let rec gen_expr env expr : string list =
@@ -389,9 +389,6 @@ and gen_while_loop env cond body =
     loop_depth = env.loop_depth + 1;
   } in
   
-  (* 循环体分析 *)
-  let body_has_calls = has_function_calls body in
-  
   (* 生成优化的循环代码 *)
   [Printf.sprintf "%s:" start_label]
   @ (gen_expr env cond)  (* 条件求值在循环外环境 *)
@@ -508,9 +505,9 @@ let peephole_optimize (code: string list) : string list =
     
     (* 优化连续的常数加载 *)
     | ins1 :: ins2 :: rest when (
-        match (Scanf.sscanf_opt ins1 "  li %s, %d@" (fun r1 n1 -> (r1, n1)),
-               Scanf.sscanf_opt ins2 "  li %s, %d@" (fun r2 n2 -> (r2, n2))) with
-        | (Some (r1, n1), Some (r2, n2)) when r1 = r2 -> true
+        match (Scanf.sscanf_opt ins1 "  li %s, %d@" (fun r1 _n1 -> r1),
+               Scanf.sscanf_opt ins2 "  li %s, %d@" (fun r2 _n2 -> r2)) with
+        | (Some r1, Some r2) when r1 = r2 -> true
         | _ -> false
       ) -> ins2 :: (optimize_pass rest)
     
