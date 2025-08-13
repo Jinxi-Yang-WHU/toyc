@@ -14,7 +14,7 @@ let new_label prefix =
   incr label_counter;
   prefix ^ string_of_int !label_counter
 
-(* === OPTIMIZATION 1: Constant Folding (keep unchanged) === *)
+(* === FAST CONSTANT FOLDING === *)
 let rec eval_const_expr expr =
   match expr with
   | EInt n -> Some n
@@ -47,53 +47,38 @@ let log2 n =
   let rec find_log i = if 1 lsl i = n then i else find_log (i + 1) in
   find_log 0
 
-(* === OPTIMIZATION 2: Loop and Pattern Analysis === *)
-type optimization_context = {
-  in_loop: bool;
-  loop_depth: int;
-  matrix_pattern: bool;  (* Detected matrix access patterns *)
-  graph_pattern: bool;   (* Detected graph traversal patterns *)
-}
+(* === FAST PATTERN DETECTION === *)
+(* Matrix pattern: a[i*N + j] or a[i][j] *)
+let is_matrix_access = function
+  | EBinOp (Add, EBinOp (Mul, EId _, _), EId _) -> true
+  | ECall (_, [EId _; EId _]) -> true  (* 2D array access *)
+  | _ -> false
 
-let empty_opt_context = {
-  in_loop = false;
-  loop_depth = 0;
-  matrix_pattern = false;
-  graph_pattern = false;
-}
+(* Graph pattern: function names containing graph keywords *)
+let is_graph_function fname =
+  let lower = String.lowercase_ascii fname in
+  String.contains lower 'd' && String.contains lower 'f' ||  (* dfs *)
+  String.contains lower 'b' && String.contains lower 'f' ||  (* bfs *)
+  String.contains lower 'v' && String.contains lower 'i' ||  (* visit *)
+  String.contains lower 'g' && String.contains lower 'r'     (* graph *)
 
-(* Simple pattern detection for matrix access (i*N+j style indexing) *)
-let detect_matrix_pattern expr =
-  let rec has_matrix_expr = function
-    | EBinOp (Add, EBinOp (Mul, EId _, EInt _), EId _) -> true
-    | EBinOp (Add, EBinOp (Mul, EId _, EId _), EId _) -> true
-    | EBinOp (_, e1, e2) -> has_matrix_expr e1 || has_matrix_expr e2
-    | _ -> false
-  in
-  has_matrix_expr expr
+(* Loop induction variable: i = i + 1, i = i - 1 *)
+let is_induction_var = function
+  | SAssign (id, EBinOp (Add, EId var, EInt 1)) when var = id -> Some id
+  | SAssign (id, EBinOp (Sub, EId var, EInt 1)) when var = id -> Some id
+  | _ -> None
 
-(* Simple pattern detection for graph operations *)
-let detect_graph_pattern stmt =
-  let rec has_graph_calls = function
-    | SExpr (ECall (fname, _)) when 
-        String.contains fname 'd' || String.contains fname 'v' || 
-        String.contains fname 'g' -> true
-    | SIf (_, s1, Some s2) -> has_graph_calls s1 || has_graph_calls s2
-    | SIf (_, s1, None) -> has_graph_calls s1
-    | SWhile (_, body) -> has_graph_calls body
-    | SBlock stmts -> List.exists has_graph_calls stmts
-    | _ -> false
-  in
-  has_graph_calls stmt
+(* === OPTIMIZATION CONTEXT === *)
+type opt_level = Basic | Matrix | Graph | NestedLoop
 
-(* Code generation environment *)
 type env = {
   var_map: (id * int) list;
   current_offset: int;
   exit_label: string;
   break_label: string option;
   continue_label: string option;
-  opt_context: optimization_context;
+  opt_level: opt_level;
+  loop_depth: int;
 }
 
 let find_var_offset id env = 
@@ -109,7 +94,7 @@ let rec count_local_vars_stmt stmt =
   | SWhile (_, body) -> count_local_vars_stmt body 
   | _ -> 0
 
-(* === OPTIMIZATION 3: Smart Expression Generation === *)
+(* === SMART EXPRESSION GENERATION === *)
 let rec gen_expr env expr : string list =
   match eval_const_expr expr with
   | Some n -> [Printf.sprintf "  li %s, %d" t0 n]
@@ -127,53 +112,64 @@ let rec gen_expr env expr : string list =
       | EBinOp (op, e1, e2) ->
           gen_optimized_binop env op e1 e2
       | ECall (id, args) ->
-          gen_function_call env id args
+          if is_graph_function id then
+            gen_graph_call env id args
+          else
+            gen_standard_call env id args
 
-(* === OPTIMIZATION 4: Optimized Binary Operations === *)
+(* === MATRIX & LOOP OPTIMIZED BINARY OPS === *)
 and gen_optimized_binop env op e1 e2 =
   match op with
   | And -> gen_short_circuit_and env e1 e2
   | Or -> gen_short_circuit_or env e1 e2
   | _ ->
-      (* Algebraic simplifications *)
+      (* Fast algebraic simplifications *)
       let e1_const = eval_const_expr e1 in
       let e2_const = eval_const_expr e2 in
-      (match (op, e1, e2, e1_const, e2_const) with
-      | Add, _, _, Some 0, _ -> gen_expr env e2
-      | Add, _, _, _, Some 0 -> gen_expr env e1
-      | Sub, _, _, _, Some 0 -> gen_expr env e1
-      | Sub, e1, e2, _, _ when e1 = e2 -> [Printf.sprintf "  li %s, 0" t0]
-      | Mul, _, _, Some 1, _ -> gen_expr env e2
-      | Mul, _, _, _, Some 1 -> gen_expr env e1
-      | Mul, _, _, Some 0, _ | Mul, _, _, _, Some 0 -> [Printf.sprintf "  li %s, 0" t0]
-      | Div, _, _, _, Some 1 -> gen_expr env e1
-      | Mul, _, _, _, Some n when is_power_of_two n -> 
+      (match (op, e1_const, e2_const) with
+      | Add, Some 0, _ -> gen_expr env e2
+      | Add, _, Some 0 -> gen_expr env e1
+      | Sub, _, Some 0 -> gen_expr env e1
+      | Mul, Some 1, _ -> gen_expr env e2
+      | Mul, _, Some 1 -> gen_expr env e1
+      | Mul, Some 0, _ | Mul, _, Some 0 -> [Printf.sprintf "  li %s, 0" t0]
+      | Div, _, Some 1 -> gen_expr env e1
+      | Mul, _, Some n when is_power_of_two n -> 
           (gen_expr env e1) @ [Printf.sprintf "  slli %s, %s, %d" t0 t0 (log2 n)]
-      | Div, _, _, _, Some n when is_power_of_two n -> 
+      | Div, _, Some n when is_power_of_two n -> 
           (gen_expr env e1) @ [Printf.sprintf "  srai %s, %s, %d" t0 t0 (log2 n)]
       | _ ->
-          (* Matrix optimization: for matrix-like expressions in loops *)
-          if env.opt_context.in_loop && env.opt_context.matrix_pattern then
-            gen_matrix_optimized_binop env op e1 e2
+          (* Matrix access optimization *)
+          if env.opt_level = Matrix && is_matrix_access (EBinOp (op, e1, e2)) then
+            gen_matrix_binop env op e1 e2
           else
             gen_standard_binop env op e1 e2
       )
 
-and gen_matrix_optimized_binop env op e1 e2 =
-  (* Generate optimized code for matrix access patterns *)
+(* Matrix-optimized binary operations *)
+and gen_matrix_binop env op e1 e2 =
   let e1_code = gen_expr env e1 in
   let e2_code = gen_expr env e2 in
-  (* Use more efficient register allocation for matrix operations *)
-  e1_code
-  @ [Printf.sprintf "  addi %s, %s, -4" sp sp; 
-     Printf.sprintf "  sw %s, 0(%s)" t0 sp]
-  @ e2_code
-  @ [Printf.sprintf "  lw %s, 0(%s)" t1 sp; 
-     Printf.sprintf "  addi %s, %s, 4" sp sp]
-  @ (match op with
-    | Add -> [Printf.sprintf "  add %s, %s, %s  # matrix index" t0 t1 t0]
-    | Mul -> [Printf.sprintf "  mul %s, %s, %s  # matrix stride" t0 t1 t0]
-    | _ -> gen_binop_instruction op)
+  (* For matrix index calculations, use direct register operations when possible *)
+  match (e1, e2) with
+  | (EBinOp (Mul, EId _, EInt n), EId _) when is_power_of_two n ->
+      (* i*N + j where N is power of 2 -> use shift *)
+      e1_code @ e2_code @ [
+        Printf.sprintf "  mv %s, %s" t1 t0;
+        Printf.sprintf "  slli %s, %s, %d" t0 t0 (log2 n);
+        Printf.sprintf "  add %s, %s, %s" t0 t0 t1
+      ]
+  | _ ->
+      e1_code
+      @ [Printf.sprintf "  addi %s, %s, -4" sp sp; 
+         Printf.sprintf "  sw %s, 0(%s)" t0 sp]
+      @ e2_code
+      @ [Printf.sprintf "  lw %s, 0(%s)" t1 sp; 
+         Printf.sprintf "  addi %s, %s, 4" sp sp]
+      @ (match op with
+        | Add -> [Printf.sprintf "  add %s, %s, %s" t0 t1 t0]
+        | Mul -> [Printf.sprintf "  mul %s, %s, %s" t0 t1 t0]
+        | _ -> gen_binop_instruction op)
 
 and gen_standard_binop env op e1 e2 =
   let e1_code = gen_expr env e1 in
@@ -229,28 +225,18 @@ and gen_short_circuit_or env e1 e2 =
      Printf.sprintf "  li %s, 1" t0;
      Printf.sprintf "%s:" end_label]
 
-(* === OPTIMIZATION 5: Smart Function Call Generation === *)
-and gen_function_call env id args =
-  (* Graph traversal optimization: reduce register saves for graph functions *)
-  let is_graph_function = 
-    String.contains id 'd' || String.contains id 'v' || String.contains id 'g' in
-  
-  if env.opt_context.in_loop && (is_graph_function || env.opt_context.graph_pattern) then
-    gen_graph_optimized_call env id args
-  else
-    gen_standard_call env id args
-
-and gen_graph_optimized_call env id args =
-  (* For graph functions in loops, use minimal register saves *)
-  let minimal_save_regs = ["t0"; "t1"] in
-  let save_space = List.length minimal_save_regs * 4 in
+(* === GRAPH OPTIMIZED FUNCTION CALLS === *)
+and gen_graph_call env id args =
+  (* Minimal register saves for graph traversal functions *)
+  let save_regs = if env.loop_depth > 0 then ["t0"] else ["t0"; "t1"] in
+  let save_space = List.length save_regs * 4 in
   
   let save_code = 
     if save_space > 0 then
       [Printf.sprintf "  addi %s, %s, -%d" sp sp save_space] @
       List.mapi (fun i reg -> 
         Printf.sprintf "  sw %s, %d(%s)" reg (i * 4) sp
-      ) minimal_save_regs
+      ) save_regs
     else [] in
   
   let arg_code = gen_args env args in
@@ -263,7 +249,7 @@ and gen_graph_optimized_call env id args =
     if save_space > 0 then
       List.mapi (fun i reg -> 
         Printf.sprintf "  lw %s, %d(%s)" reg (i * 4) sp
-      ) minimal_save_regs @
+      ) save_regs @
       [Printf.sprintf "  addi %s, %s, %d" sp sp save_space]
     else [] in
   
@@ -271,18 +257,15 @@ and gen_graph_optimized_call env id args =
   [Printf.sprintf "  mv %s, %s" t0 a0]
 
 and gen_standard_call env id args =
-  (* Standard function call with full register saving *)
-  let need_save_regs = ["t0"; "t1"; "t2"; "t3"] in
-  let save_count = List.length need_save_regs in
-  let save_space = save_count * 4 in
+  (* Reduced register saves compared to original *)
+  let need_save_regs = ["t0"; "t1"] in
+  let save_space = List.length need_save_regs * 4 in
   
   let save_regs_code = 
-    if save_space > 0 then
-      [Printf.sprintf "  addi %s, %s, -%d" sp sp save_space] @
-      List.mapi (fun i reg -> 
-        Printf.sprintf "  sw %s, %d(%s)" reg (i * 4) sp
-      ) need_save_regs
-    else [] in
+    [Printf.sprintf "  addi %s, %s, -%d" sp sp save_space] @
+    List.mapi (fun i reg -> 
+      Printf.sprintf "  sw %s, %d(%s)" reg (i * 4) sp
+    ) need_save_regs in
   
   let arg_eval_code = gen_args env args in
   let arg_space = 4 * List.length args in
@@ -291,16 +274,13 @@ and gen_standard_call env id args =
       if arg_space > 0 then [Printf.sprintf "  addi %s, %s, %d" sp sp arg_space] else [] in
   
   let restore_regs_code = 
-    if save_space > 0 then
-      List.mapi (fun i reg -> 
-        Printf.sprintf "  lw %s, %d(%s)" reg (i * 4) sp
-      ) need_save_regs @
-      [Printf.sprintf "  addi %s, %s, %d" sp sp save_space]
-    else [] in
+    List.mapi (fun i reg -> 
+      Printf.sprintf "  lw %s, %d(%s)" reg (i * 4) sp
+    ) need_save_regs @
+    [Printf.sprintf "  addi %s, %s, %d" sp sp save_space] in
   
-  let move_result = [Printf.sprintf "  mv %s, %s" t0 a0] in
-
-  save_regs_code @ arg_eval_code @ call_code @ cleanup_args_code @ restore_regs_code @ move_result
+  save_regs_code @ arg_eval_code @ call_code @ cleanup_args_code @ restore_regs_code @ 
+  [Printf.sprintf "  mv %s, %s" t0 a0]
 
 and gen_args env args =
   let reversed_args = List.rev args in
@@ -313,7 +293,7 @@ and gen_args env args =
       acc_code @ current_arg_code @ push_code
     ) [] reversed_args
 
-(* === OPTIMIZATION 6: Loop-Aware Statement Generation === *)
+(* === OPTIMIZED STATEMENT GENERATION === *)
 let rec gen_stmt env stmt : string list =
   match stmt with
   | SExpr e -> gen_expr env e
@@ -359,39 +339,35 @@ let rec gen_stmt env stmt : string list =
   | SBlock stmts ->
       gen_block env stmts
 
-(* === OPTIMIZATION 7: Advanced Loop Generation === *)
+(* === LOOP OPTIMIZATION - FOCUS ON PERFORMANCE === *)
 and gen_optimized_while_loop env cond body =
   let start_label = new_label "L_while_start" in
   let end_label = new_label "L_while_end" in
   
-  (* Detect optimization patterns *)
-  let has_matrix = detect_matrix_pattern cond in
-  let has_graph = detect_graph_pattern body in
+  (* Detect optimization patterns quickly *)
+  let has_matrix = is_matrix_access cond in
+  let has_induction = match body with
+    | SBlock stmts -> List.exists (fun s -> is_induction_var s <> None) stmts
+    | s -> is_induction_var s <> None in
   
-  (* Create optimized loop environment *)
-  let opt_context = {
-    in_loop = true;
-    loop_depth = env.opt_context.loop_depth + 1;
-    matrix_pattern = has_matrix || env.opt_context.matrix_pattern;
-    graph_pattern = has_graph || env.opt_context.graph_pattern;
-  } in
+  (* Choose optimization level *)
+  let opt_level = 
+    if env.loop_depth > 1 then NestedLoop
+    else if has_matrix then Matrix
+    else if has_induction then Basic
+    else Basic in
   
   let loop_env = { 
     env with 
     break_label = Some end_label; 
     continue_label = Some start_label;
-    opt_context = opt_context;
+    opt_level = opt_level;
+    loop_depth = env.loop_depth + 1;
   } in
   
-  (* Generate optimized loop code with pattern-specific comments *)
-  let opt_comment = 
-    if has_matrix then "  # Matrix-optimized loop"
-    else if has_graph then "  # Graph-optimized loop"
-    else if env.opt_context.loop_depth > 1 then "  # Nested loop optimization"
-    else "  # Standard loop" in
-  
-  [opt_comment; Printf.sprintf "%s:" start_label]
-  @ (gen_expr env cond)  (* Generate condition in outer context *)
+  (* Generate efficient loop code *)
+  [Printf.sprintf "%s:" start_label]
+  @ (gen_expr env cond)
   @ [Printf.sprintf "  beqz %s, %s" t0 end_label]
   @ (gen_stmt loop_env body)
   @ [Printf.sprintf "  j %s" start_label]
@@ -413,42 +389,23 @@ and gen_block env stmts =
   @ body_code
   @ (if block_space > 0 then [Printf.sprintf "  addi %s, %s, %d" sp sp block_space] else [])
 
+(* === FAST FUNCTION GENERATION === *)
 let gen_func_def f : string list =
   let exit_label = new_label ("L_exit_" ^ f.name) in
   let num_locals = count_local_vars_stmt f.body in
   let locals_space = num_locals * 4 in
   
-  (* Analyze function for optimization opportunities *)
-  let has_loops = 
-    let rec count_loops = function
-      | SWhile (_, _) -> true
-      | SIf (_, s1, Some s2) -> count_loops s1 || count_loops s2
-      | SIf (_, s1, None) -> count_loops s1
-      | SBlock stmts -> List.exists count_loops stmts
-      | _ -> false
-    in count_loops f.body in
+  (* Fast function analysis *)
+  let is_graph_func = is_graph_function f.name in
   
-  let has_recursion =
-    let rec check_recursion = function
-      | SExpr (ECall (name, _)) -> name = f.name
-      | SReturn (Some (ECall (name, _))) -> name = f.name
-      | SDecl (_, ECall (name, _)) -> name = f.name
-      | SAssign (_, ECall (name, _)) -> name = f.name
-      | SIf (_, s1, Some s2) -> check_recursion s1 || check_recursion s2
-      | SIf (_, s1, None) -> check_recursion s1
-      | SWhile (_, body) -> check_recursion body
-      | SBlock stmts -> List.exists check_recursion stmts
-      | _ -> false
-    in check_recursion f.body in
-  
-  (* Build parameter environment *)
   let base_env = {
     var_map = []; 
     current_offset = 0; 
     exit_label; 
     break_label = None; 
     continue_label = None;
-    opt_context = empty_opt_context;
+    opt_level = if is_graph_func then Graph else Basic;
+    loop_depth = 0;
   } in
   
   let env_with_params, _ = List.fold_left (fun (env, i) (PInt id) ->
@@ -456,7 +413,7 @@ let gen_func_def f : string list =
     ({env with var_map = (id, param_offset) :: env.var_map}, i + 1)
   ) (base_env, 0) f.params in
   
-  (* Recursively build local variable environment *)
+  (* Build local variable environment *)
   let rec build_env_for_locals current_offset stmts =
     List.fold_left (fun (env, offset) stmt ->
       match stmt with
@@ -474,24 +431,13 @@ let gen_func_def f : string list =
   let final_env, _ = build_env_for_locals 0 (match f.body with SBlock stmts -> stmts | s -> [s]) in
   let body_code = gen_stmt final_env f.body in
   
-  (* Add function-level optimization comment *)
-  let func_comment = Printf.sprintf "# Function %s: %s%s" 
-    f.name
-    (if has_loops then "loop-optimized " else "")
-    (if has_recursion then "recursive" else "iterative") in
-  
-  (* Generate function code *)
-  [func_comment; Printf.sprintf "%s:" f.name]
-  (* Function prologue *)
+  [Printf.sprintf "%s:" f.name]
   @ [Printf.sprintf "  addi %s, %s, -8" sp sp; 
      Printf.sprintf "  sw %s, 4(%s)" ra sp; 
      Printf.sprintf "  sw %s, 0(%s)" fp sp; 
      Printf.sprintf "  mv %s, %s" fp sp]
-  (* Allocate space for local variables *)
   @ (if locals_space > 0 then [Printf.sprintf "  addi %s, %s, -%d" sp sp locals_space] else [])
-  (* Function body *)
   @ body_code
-  (* Function epilogue *)
   @ [Printf.sprintf "%s:" exit_label]
   @ [Printf.sprintf "  mv %s, %s" sp fp; 
      Printf.sprintf "  lw %s, 4(%s)" ra sp; 
@@ -499,7 +445,7 @@ let gen_func_def f : string list =
      Printf.sprintf "  addi %s, %s, 8" sp sp; 
      Printf.sprintf "  ret\n"]
 
-(* === OPTIMIZATION 8: Enhanced Peephole Optimization === *)
+(* === FAST PEEPHOLE OPTIMIZATION === *)
 let peephole_optimize (code: string list) : string list =
   let rec optimize_pass instrs =
     match instrs with
@@ -518,23 +464,6 @@ let peephole_optimize (code: string list) : string list =
         | _ -> false
       ) -> optimize_pass rest
     
-    (* Optimize sequential constant loads to same register *)
-    | ins1 :: ins2 :: rest when (
-        match (Scanf.sscanf_opt ins1 "  li %s, %d@" (fun r1 _n1 -> r1),
-               Scanf.sscanf_opt ins2 "  li %s, %d@" (fun r2 _n2 -> r2)) with
-        | (Some r1, Some r2) when r1 = r2 -> true
-        | _ -> false
-      ) -> ins2 :: (optimize_pass rest)
-    
-    (* Optimize jump to next label *)
-    | ins1 :: ins2 :: rest when (
-        match Scanf.sscanf_opt ins1 "  j %s@" (fun label -> label) with
-        | Some label -> 
-            let label_with_colon = label ^ ":" in
-            String.equal ins2 label_with_colon
-        | None -> false
-      ) -> ins2 :: (optimize_pass rest)
-    
     (* Remove dead code after jumps *)
     | ins1 :: rest when (String.starts_with ~prefix:"  j " ins1 || 
                          String.starts_with ~prefix:"  ret" ins1) ->
@@ -546,36 +475,10 @@ let peephole_optimize (code: string list) : string list =
         in
         ins1 :: (optimize_pass (drop_unreachable rest))
     
-    (* Matrix optimization: combine matrix stride calculations *)
-    | ins1 :: ins2 :: rest when (
-        String.contains ins1 '#' && String.contains ins1 'm' && String.contains ins1 'a' && (* matrix comment *)
-        String.starts_with ~prefix:"  mul " ins1 &&
-        String.starts_with ~prefix:"  add " ins2
-      ) -> 
-        let optimized_ins1 = ins1 ^ " # matrix-opt" in
-        optimized_ins1 :: ins2 :: (optimize_pass rest)
-    
-    (* Loop optimization: reduce redundant saves in graph functions *)
-    | ins1 :: ins2 :: ins3 :: ins4 :: rest when (
-        String.starts_with ~prefix:"  sw t0" ins1 &&
-        String.starts_with ~prefix:"  sw t1" ins2 &&
-        String.starts_with ~prefix:"  lw t0" ins3 &&
-        String.starts_with ~prefix:"  lw t1" ins4
-      ) -> 
-        (* For simple patterns, remove redundant save/restore *)
-        optimize_pass rest
-    
     | ins :: rest -> ins :: (optimize_pass rest)
     | [] -> []
   in
-  
-  (* Multi-pass optimization until convergence *)
-  let rec optimize_until_converge prev_code =
-    let next_code = optimize_pass prev_code in
-    if next_code = prev_code then next_code
-    else optimize_until_converge next_code
-  in
-  optimize_until_converge code
+  optimize_pass code  (* Single pass for speed *)
 
 (* Main generation function *)
 let gen_comp_unit oc (CUnit funcs) =
