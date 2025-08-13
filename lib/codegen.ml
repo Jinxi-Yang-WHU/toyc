@@ -67,7 +67,7 @@ let detect_matrix_pattern expr =
   let rec has_matrix_expr = function
     | EBinOp (Add, EBinOp (Mul, EId _, EInt _), EId _) -> true
     | EBinOp (Add, EBinOp (Mul, EId _, EId _), EId _) -> true
-    | EBinOp (op, e1, e2) -> has_matrix_expr e1 || has_matrix_expr e2
+    | EBinOp (_, e1, e2) -> has_matrix_expr e1 || has_matrix_expr e2
     | _ -> false
   in
   has_matrix_expr expr
